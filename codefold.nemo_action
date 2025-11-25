@@ -1,0 +1,8 @@
+[Nemo Action]
+Name=CodeFold
+Comment=Combine directory or extract files
+Exec=bash -c 'if [ -d "%F" ]; then python3 /usr/local/bin/codefold.py -c "%F" "$(dirname "%F")/$(basename "%F")_combined.txt"; else python3 /usr/local/bin/codefold.py -e "%F" "$(dirname "%F")/$(basename "%F" .txt)_extracted"; fi'
+Icon-Name=folder-symbolic
+Selection=s
+Extensions=dir;txt;
+Quote=double
