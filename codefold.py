@@ -3,14 +3,21 @@
 
 """
 CodeFold - A professional tool for combining and extracting project files
-Version: 1.0.0
+Version: 1.1.0
 """
 
 import os
 import sys
+import fnmatch
 import argparse
 from pathlib import Path
 from collections import defaultdict
+
+# نام فایل ایگنور که در ریشه پروژه خوانده می‌شود
+IGNORE_FILENAME = '.codefoldignore'
+
+# متن پیش‌فرض جایگزینی (اگر در فایل ایگنور بعد از => چیزی نوشته نشود)
+DEFAULT_PLACEHOLDER = 'این فایل وجود دارد اما بخاطر محدودیت های ai برای تو ارسال نشده است.'
 
 # Extended text file extensions with their MIME types
 TEXT_EXTENSIONS_MIME = {
@@ -144,10 +151,11 @@ BINARY_EXTENSIONS_MIME = {
     '.pyc': 'application/x-bytecode.python',
 }
 
+
 def get_mime_type_by_extension(file_path):
     """Get MIME type based on file extension"""
     _, ext = os.path.splitext(file_path.lower())
-    
+
     if ext in TEXT_EXTENSIONS_MIME:
         return TEXT_EXTENSIONS_MIME[ext]
     elif ext in BINARY_EXTENSIONS_MIME:
@@ -155,12 +163,121 @@ def get_mime_type_by_extension(file_path):
     else:
         return 'application/octet-stream'
 
+
 def is_text_file(file_path):
     """Check if file is a text file based on extension"""
     _, ext = os.path.splitext(file_path.lower())
     return ext in TEXT_EXTENSIONS_MIME
 
-def detect_tech_stack(root_dir):
+
+# ─────────────────────────────────────────────────────────────
+#  بخش مربوط به فایل ایگنور (.codefoldignore)
+# ─────────────────────────────────────────────────────────────
+
+def load_ignore_rules(root_dir):
+    """
+    خواندن فایل .codefoldignore از ریشه پروژه.
+    دو دسته قانون برمی‌گرداند:
+      - ignore_patterns : لیست الگوهایی که کاملاً نادیده گرفته می‌شوند
+      - replace_rules   : لیست تاپل (pattern, placeholder_text) برای جایگزینی محتوا
+    اگر فایل ایگنور وجود نداشته باشد، هر دو لیست خالی برمی‌گردند.
+    """
+    ignore_patterns = []
+    replace_rules = []
+
+    ignore_path = os.path.join(root_dir, IGNORE_FILENAME)
+    if not os.path.isfile(ignore_path):
+        return ignore_patterns, replace_rules
+
+    try:
+        with open(ignore_path, 'r', encoding='utf-8') as f:
+            raw_lines = f.readlines()
+    except Exception:
+        return ignore_patterns, replace_rules
+
+    for raw in raw_lines:
+        line = raw.strip()
+
+        # کامنت یا خط خالی
+        if not line or line.startswith('#'):
+            continue
+
+        # قانون جایگزینی محتوا:  pattern  =>  متن
+        if '=>' in line:
+            pattern_part, _, text_part = line.partition('=>')
+            pattern = pattern_part.strip()
+            placeholder = text_part.strip()
+            if not placeholder:
+                placeholder = DEFAULT_PLACEHOLDER
+            if pattern:
+                replace_rules.append((pattern, placeholder))
+        else:
+            # قانون نادیده‌گیری کامل
+            ignore_patterns.append(line)
+
+    return ignore_patterns, replace_rules
+
+
+def _match_pattern(rel_path, is_dir, pattern):
+    """
+    بررسی تطابق یک مسیر نسبی با یک الگوی glob.
+    از / برای مسیرها استفاده می‌شود.
+    اگر الگو با / تمام شود فقط برای پوشه‌ها معتبر است.
+    الگو می‌تواند نام پایه فایل یا مسیر کامل را هدف بگیرد.
+    """
+    rel_path = rel_path.replace('\\', '/')
+    base_name = os.path.basename(rel_path)
+
+    dir_only = pattern.endswith('/')
+    pat = pattern.rstrip('/')
+
+    if dir_only and not is_dir:
+        return False
+
+    # تطابق با مسیر کامل
+    if fnmatch.fnmatch(rel_path, pat):
+        return True
+
+    # تطابق با نام پایه (مثلاً *.log یا node_modules)
+    if fnmatch.fnmatch(base_name, pat):
+        return True
+
+    # پشتیبانی از ** برای مسیرهای تودرتو (مثلاً vendor/**)
+    if '**' in pat:
+        simplified = pat.replace('**/', '').replace('/**', '').replace('**', '*')
+        if fnmatch.fnmatch(rel_path, simplified) or fnmatch.fnmatch(base_name, simplified):
+            return True
+
+    # اگر الگو یک پیشوند پوشه باشد (مثلاً node_modules باعث نادیده‌گیری داخل آن شود)
+    prefix = pat.rstrip('/') + '/'
+    if rel_path.startswith(prefix) or ('/' + prefix) in ('/' + rel_path):
+        return True
+
+    return False
+
+
+def is_ignored(rel_path, is_dir, ignore_patterns):
+    """آیا این مسیر باید کاملاً نادیده گرفته شود؟"""
+    for pattern in ignore_patterns:
+        if _match_pattern(rel_path, is_dir, pattern):
+            return True
+    return False
+
+
+def get_replacement(rel_path, replace_rules):
+    """
+    اگر این فایل مشمول قانون جایگزینی باشد، متن جایگزین را برمی‌گرداند.
+    در غیر این صورت None برمی‌گرداند.
+    """
+    for pattern, placeholder in replace_rules:
+        if _match_pattern(rel_path, False, pattern):
+            return placeholder
+    return None
+
+
+# ─────────────────────────────────────────────────────────────
+
+def detect_tech_stack(root_dir, ignore_patterns=None):
     """Detect technologies based on file extensions present"""
     extension_tech_map = {
         '.py': 'Python',
@@ -190,47 +307,87 @@ def detect_tech_stack(root_dir):
         '.sql': 'SQL',
         '.sh': 'Shell',
     }
-    
+
+    if ignore_patterns is None:
+        ignore_patterns = []
+
     detected_techs = set()
-    
-    for root, _, files in os.walk(root_dir):
+
+    for root, dirs, files in os.walk(root_dir):
+        # حذف پوشه‌های نادیده‌گرفته‌شده از پیمایش
+        pruned_dirs = []
+        for d in dirs:
+            rel_d = os.path.relpath(os.path.join(root, d), root_dir)
+            if not is_ignored(rel_d, True, ignore_patterns):
+                pruned_dirs.append(d)
+        dirs[:] = pruned_dirs
+
         for file in files:
+            rel_f = os.path.relpath(os.path.join(root, file), root_dir)
+            if is_ignored(rel_f, False, ignore_patterns):
+                continue
             _, ext = os.path.splitext(file.lower())
             if ext in extension_tech_map:
                 detected_techs.add(extension_tech_map[ext])
-    
+
     return ', '.join(sorted(detected_techs)) if detected_techs else 'Not detected'
 
-def count_items(root_dir):
-    """Count files and directories in project"""
+
+def count_items(root_dir, ignore_patterns=None):
+    """Count files and directories in project (respecting ignore rules)"""
+    if ignore_patterns is None:
+        ignore_patterns = []
+
     file_count = 0
     dir_count = 0
-    
+
     for root, dirs, files in os.walk(root_dir):
-        dir_count += len(dirs)
-        file_count += len(files)
-    
+        pruned_dirs = []
+        for d in dirs:
+            rel_d = os.path.relpath(os.path.join(root, d), root_dir)
+            if not is_ignored(rel_d, True, ignore_patterns):
+                pruned_dirs.append(d)
+        dirs[:] = pruned_dirs
+
+        dir_count += len(pruned_dirs)
+
+        for file in files:
+            rel_f = os.path.relpath(os.path.join(root, file), root_dir)
+            if is_ignored(rel_f, False, ignore_patterns):
+                continue
+            file_count += 1
+
     return file_count, dir_count
+
 
 def combine_files(root_dir, output_file=None):
     """Combine all files in directory into a JSON-like structure"""
     root_path = Path(root_dir).resolve()
     project_name = root_path.name
-    
+
     if output_file is None:
         output_file = f"{project_name}.txt"
-    
+
+    # خواندن قوانین ایگنور از ریشه پروژه
+    ignore_patterns, replace_rules = load_ignore_rules(root_dir)
+
     # Collect all items
     items = []
-    
+
     for root, dirs, files in os.walk(root_dir):
-        rel_root = os.path.relpath(root, root_dir)
-        
+        # حذف پوشه‌های نادیده‌گرفته‌شده از پیمایش (تا وارد آن‌ها نشویم)
+        pruned_dirs = []
+        for d in dirs:
+            rel_d = os.path.relpath(os.path.join(root, d), root_dir)
+            if not is_ignored(rel_d, True, ignore_patterns):
+                pruned_dirs.append(d)
+        dirs[:] = pruned_dirs
+
         # Add empty directories
-        for dir_name in sorted(dirs):
+        for dir_name in sorted(pruned_dirs):
             dir_path = os.path.join(root, dir_name)
             rel_path = os.path.relpath(dir_path, root_dir)
-            
+
             # Check if directory is empty
             if not os.listdir(dir_path):
                 items.append({
@@ -238,32 +395,44 @@ def combine_files(root_dir, output_file=None):
                     'type': 'directory',
                     'content': '<empty folder>'
                 })
-        
+
         # Add files
         for file_name in sorted(files):
             file_path = os.path.join(root, file_name)
             rel_path = os.path.relpath(file_path, root_dir)
+            rel_path_norm = rel_path.replace('\\', '/')
+
+            # نادیده گرفتن کامل فایل
+            if is_ignored(rel_path, False, ignore_patterns):
+                continue
+
             mime_type = get_mime_type_by_extension(file_path)
-            
+
             item = {
-                'name': rel_path.replace('\\', '/'),
+                'name': rel_path_norm,
                 'type': mime_type
             }
-            
-            if is_text_file(file_path):
+
+            # بررسی قانون جایگزینی محتوا
+            replacement = get_replacement(rel_path, replace_rules)
+
+            if replacement is not None:
+                # فایل هست ولی محتوایش با متن جایگزین عوض می‌شود
+                item['content'] = replacement
+            elif is_text_file(file_path):
                 try:
                     with open(file_path, 'r', encoding='utf-8') as f:
                         content = f.read()
                     item['content'] = content
                 except Exception as e:
                     item['content'] = f'<error reading file: {str(e)}>'
-            
+
             items.append(item)
-    
+
     # Get project statistics
-    file_count, dir_count = count_items(root_dir)
-    tech_stack = detect_tech_stack(root_dir)
-    
+    file_count, dir_count = count_items(root_dir, ignore_patterns)
+    tech_stack = detect_tech_stack(root_dir, ignore_patterns)
+
     # Write output
     with open(output_file, 'w', encoding='utf-8') as f:
         # Write header
@@ -272,14 +441,14 @@ def combine_files(root_dir, output_file=None):
         f.write(f"Total directories: {dir_count}\n")
         f.write(f"Tech Stack: {tech_stack}\n")
         f.write("=" * 30 + "\n\n")
-        
+
         # Write JSON-like structure
         f.write("[\n")
         for i, item in enumerate(items):
             f.write("  {\n")
             f.write(f'    "name": "{item["name"]}",\n')
             f.write(f'    "type": "{item["type"]}"')
-            
+
             if 'content' in item:
                 f.write(',\n')
                 f.write('    "content": \n')
@@ -288,19 +457,22 @@ def combine_files(root_dir, output_file=None):
                 f.write('\n"\n')
             else:
                 f.write('\n')
-            
+
             if i < len(items) - 1:
                 f.write("  },\n")
             else:
                 f.write("  }\n")
-        
+
         f.write("]\n")
-    
+
     print(f"Successfully created: {output_file}")
     print(f"Project: {project_name}")
     print(f"Files: {file_count} | Directories: {dir_count}")
     print(f"Tech Stack: {tech_stack}")
-    
+    if ignore_patterns or replace_rules:
+        print(f"Ignore rules: {len(ignore_patterns)} ignored, "
+              f"{len(replace_rules)} replaced (from {IGNORE_FILENAME})")
+
     # ✨ اضافه کردن notification
     try:
         import subprocess
@@ -311,84 +483,85 @@ def combine_files(root_dir, output_file=None):
         ], check=False, stderr=subprocess.DEVNULL)
     except:
         pass
-    
+
     return output_file
+
 
 def extract_files(input_file, output_dir):
     """Extract files from combined format back to directory structure"""
     if not os.path.exists(input_file):
         print(f"Error: Input file '{input_file}' not found.")
         sys.exit(1)
-    
+
     # Create output directory
     os.makedirs(output_dir, exist_ok=True)
-    
+
     # Read the file
     with open(input_file, 'r', encoding='utf-8') as f:
         lines = f.readlines()
-    
+
     # Skip header (find the start of JSON structure)
     start_idx = 0
     for i, line in enumerate(lines):
         if line.strip() == '[':
             start_idx = i
             break
-    
+
     # Parse items
     items = []
     current_item = {}
     in_content = False
     content_lines = []
-    
+
     i = start_idx + 1
     while i < len(lines):
         line = lines[i]
         stripped = line.strip()
-        
+
         if stripped == '{':
             current_item = {}
             in_content = False
             content_lines = []
-        
+
         elif stripped.startswith('"name":'):
             name = stripped.split(':', 1)[1].strip().strip(',').strip('"')
             current_item['name'] = name
-        
+
         elif stripped.startswith('"type":'):
             type_val = stripped.split(':', 1)[1].strip().strip(',').strip('"')
             current_item['type'] = type_val
-        
+
         elif stripped == '"content":':
             in_content = True
             i += 1  # Skip the opening quote line
-        
+
         elif in_content and stripped == '"':
             # End of content
             current_item['content'] = ''.join(content_lines)
             in_content = False
             content_lines = []
-        
+
         elif in_content:
             # Content line
             content_lines.append(lines[i])
-        
+
         elif stripped in ['},', '}']:
             if current_item:
                 items.append(current_item)
                 current_item = {}
-        
+
         i += 1
-    
+
     # Create files and directories
     created_files = 0
     created_dirs = 0
-    
+
     for item in items:
         if not item.get('name'):
             continue
-        
+
         full_path = os.path.join(output_dir, item['name'])
-        
+
         if item.get('type') == 'directory':
             os.makedirs(full_path, exist_ok=True)
             created_dirs += 1
@@ -396,7 +569,7 @@ def extract_files(input_file, output_dir):
         else:
             # Create parent directories
             os.makedirs(os.path.dirname(full_path), exist_ok=True)
-            
+
             if 'content' in item:
                 # Text file with content
                 with open(full_path, 'w', encoding='utf-8') as f:
@@ -407,12 +580,12 @@ def extract_files(input_file, output_dir):
                 with open(full_path, 'wb') as f:
                     pass
                 print(f"Created binary placeholder: {full_path}")
-            
+
             created_files += 1
-    
+
     print(f"\nExtraction completed!")
     print(f"Created {created_files} files and {created_dirs} directories in '{output_dir}'")
-    
+
     # ✨ اضافه کردن notification
     try:
         import subprocess
@@ -424,15 +597,16 @@ def extract_files(input_file, output_dir):
     except:
         pass
 
+
 def interactive_mode():
     """Interactive mode for user input"""
     print("=== CodeFold - Interactive Mode ===\n")
     print("Choose operation:")
     print("1. Combine files (directory -> text file)")
     print("2. Extract files (text file -> directory)")
-    
+
     choice = input("\nEnter choice (1 or 2): ").strip()
-    
+
     if choice == '1':
         path = input("Enter project directory path: ").strip().strip('"\'')
         if not os.path.isdir(path):
@@ -447,6 +621,7 @@ def interactive_mode():
         print("Invalid choice.")
         sys.exit(1)
 
+
 def main():
     """Main entry point"""
     parser = argparse.ArgumentParser(
@@ -457,22 +632,26 @@ Examples:
   Combine files:
     python codefold.py -c /path/to/project output.txt
     python codefold.py -c /path/to/project
-  
+
   Extract files:
     python codefold.py -e output.txt /path/to/extracted
-    
+
   Interactive mode:
     python codefold.py
+
+Ignore file:
+  Put a '.codefoldignore' in the project root to skip files/folders
+  or replace their content. See README for the format.
         """
     )
-    
+
     parser.add_argument('-c', '--combine', nargs='+', metavar=('DIR', 'OUTPUT'),
                         help='Combine files from directory')
     parser.add_argument('-e', '--extract', nargs=2, metavar=('INPUT', 'OUTPUT'),
                         help='Extract files from text to directory')
-    
+
     args = parser.parse_args()
-    
+
     if args.combine:
         if len(args.combine) == 1:
             combine_files(args.combine[0])
@@ -483,6 +662,7 @@ Examples:
     else:
         # No arguments - run interactive mode
         interactive_mode()
+
 
 if __name__ == "__main__":
     main()
